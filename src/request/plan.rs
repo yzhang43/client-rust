@@ -84,7 +84,7 @@ impl<Req: KvRequest + StoreRequest> StoreRequest for Dispatch<Req> {
     }
 }
 
-const MULTI_REGION_CONCURRENCY: usize = 32;
+const MULTI_REGION_CONCURRENCY: usize = 16;
 const MULTI_STORES_CONCURRENCY: usize = 16;
 
 fn is_grpc_error(e: &Error) -> bool {

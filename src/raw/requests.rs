@@ -42,7 +42,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tonic::transport::Channel;
 
-const RAW_KV_REQUEST_BATCH_SIZE: u64 = 16 * 1024; // 16 KB
+const RAW_KV_REQUEST_BATCH_SIZE: u64 = 256 * 1024; // 16 KB
 
 pub fn new_raw_get_request(key: Vec<u8>, cf: Option<ColumnFamily>) -> kvrpcpb::RawGetRequest {
     let mut req = kvrpcpb::RawGetRequest::default();
