@@ -44,41 +44,46 @@ macro_rules! pd_request {
 // These methods make a single attempt to make a request.
 impl Cluster {
     pub async fn get_region(
-        &mut self,
+        &self,
         key: Vec<u8>,
         timeout: Duration,
     ) -> Result<pdpb::GetRegionResponse> {
         let mut req = pd_request!(self.id, pdpb::GetRegionRequest);
         req.region_key = key;
-        req.send(&mut self.client, timeout).await
+        // Clone tonic client so requests can run concurrently without taking &mut self.
+        let mut client = self.client.clone();
+        req.send(&mut client, timeout).await
     }
 
     pub async fn get_region_by_id(
-        &mut self,
+        &self,
         id: u64,
         timeout: Duration,
     ) -> Result<pdpb::GetRegionResponse> {
         let mut req = pd_request!(self.id, pdpb::GetRegionByIdRequest);
         req.region_id = id;
-        req.send(&mut self.client, timeout).await
+        let mut client = self.client.clone();
+        req.send(&mut client, timeout).await
     }
 
     pub async fn get_store(
-        &mut self,
+        &self,
         id: u64,
         timeout: Duration,
     ) -> Result<pdpb::GetStoreResponse> {
         let mut req = pd_request!(self.id, pdpb::GetStoreRequest);
         req.store_id = id;
-        req.send(&mut self.client, timeout).await
+        let mut client = self.client.clone();
+        req.send(&mut client, timeout).await
     }
 
     pub async fn get_all_stores(
-        &mut self,
+        &self,
         timeout: Duration,
     ) -> Result<pdpb::GetAllStoresResponse> {
         let req = pd_request!(self.id, pdpb::GetAllStoresRequest);
-        req.send(&mut self.client, timeout).await
+        let mut client = self.client.clone();
+        req.send(&mut client, timeout).await
     }
 
     pub async fn get_timestamp(&self) -> Result<Timestamp> {
@@ -86,23 +91,25 @@ impl Cluster {
     }
 
     pub async fn update_safepoint(
-        &mut self,
+        &self,
         safepoint: u64,
         timeout: Duration,
     ) -> Result<pdpb::UpdateGcSafePointResponse> {
         let mut req = pd_request!(self.id, pdpb::UpdateGcSafePointRequest);
         req.safe_point = safepoint;
-        req.send(&mut self.client, timeout).await
+        let mut client = self.client.clone();
+        req.send(&mut client, timeout).await
     }
 
     pub async fn load_keyspace(
-        &mut self,
+        &self,
         keyspace: &str,
         timeout: Duration,
     ) -> Result<keyspacepb::KeyspaceMeta> {
         let mut req = pd_request!(self.id, keyspacepb::LoadKeyspaceRequest);
         req.name = keyspace.to_string();
-        let resp = req.send(&mut self.keyspace_client, timeout).await?;
+        let mut keyspace_client = self.keyspace_client.clone();
+        let resp = req.send(&mut keyspace_client, timeout).await?;
         let keyspace = resp
             .keyspace
             .ok_or_else(|| Error::KeyspaceNotFound(keyspace.to_owned()))?;

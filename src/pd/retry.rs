@@ -9,6 +9,7 @@ use std::time::Instant;
 
 use async_trait::async_trait;
 use tokio::sync::RwLock;
+use tokio::sync::Semaphore;
 use tokio::time::sleep;
 
 use crate::pd::Cluster;
@@ -30,6 +31,11 @@ use crate::SecurityManager;
 const RECONNECT_INTERVAL_SEC: u64 = 1;
 const MAX_REQUEST_COUNT: usize = 5;
 const LEADER_CHANGE_RETRY: usize = 10;
+// Limit concurrent PD RPCs per `RetryClient` instance. This replaces the implicit
+// single-threaded bottleneck of the historical global write-lock around PD calls.
+//
+// NOTE: This is intentionally conservative; callers may have very high concurrency.
+const MAX_CONCURRENT_PD_REQUESTS: usize = 64;
 
 #[async_trait]
 pub trait RetryClientTrait {
@@ -55,6 +61,7 @@ pub struct RetryClient<Cl = Cluster> {
     cluster: RwLock<(Cl, Instant)>,
     connection: Connection,
     timeout: Duration,
+    permits: Arc<Semaphore>,
 }
 
 #[cfg(test)]
@@ -69,6 +76,7 @@ impl<Cl> RetryClient<Cl> {
             cluster: RwLock::new((cluster, Instant::now())),
             connection,
             timeout,
+            permits: Arc::new(Semaphore::new(MAX_CONCURRENT_PD_REQUESTS)),
         }
     }
 }
@@ -77,6 +85,9 @@ macro_rules! retry_core {
     ($self: ident, $tag: literal, $call: expr) => {{
         let stats = pd_stats($tag);
         let mut last_err = Ok(());
+        // Limit concurrent PD requests. We intentionally include the entire retry loop to avoid
+        // retry storms from exceeding the cap.
+        let _permit = $self.permits.acquire().await.unwrap();
         for _ in 0..LEADER_CHANGE_RETRY {
             let res = $call;
 
@@ -97,17 +108,6 @@ macro_rules! retry_core {
 
         last_err?;
         unreachable!();
-    }};
-}
-
-macro_rules! retry_mut {
-    ($self: ident, $tag: literal, |$cluster: ident| $call: expr) => {{
-        retry_core!($self, $tag, {
-            // use the block here to drop the guard of the lock,
-            // otherwise `reconnect` will try to acquire the write lock and results in a deadlock
-            let $cluster = &mut $self.cluster.write().await.0;
-            $call.await
-        })
     }};
 }
 
@@ -137,6 +137,7 @@ impl RetryClient<Cluster> {
             cluster,
             connection,
             timeout,
+            permits: Arc::new(Semaphore::new(MAX_CONCURRENT_PD_REQUESTS)),
         })
     }
 }
@@ -146,7 +147,7 @@ impl RetryClientTrait for RetryClient<Cluster> {
     // These get_* functions will try multiple times to make a request, reconnecting as necessary.
     // It does not know about encoding. Caller should take care of it.
     async fn get_region(self: Arc<Self>, key: Vec<u8>) -> Result<RegionWithLeader> {
-        retry_mut!(self, "get_region", |cluster| {
+        retry!(self, "get_region", |cluster| {
             let key = key.clone();
             async {
                 cluster
@@ -160,7 +161,7 @@ impl RetryClientTrait for RetryClient<Cluster> {
     }
 
     async fn get_region_by_id(self: Arc<Self>, region_id: RegionId) -> Result<RegionWithLeader> {
-        retry_mut!(self, "get_region_by_id", |cluster| async {
+        retry!(self, "get_region_by_id", |cluster| async {
             cluster
                 .get_region_by_id(region_id, self.timeout)
                 .await
@@ -171,7 +172,7 @@ impl RetryClientTrait for RetryClient<Cluster> {
     }
 
     async fn get_store(self: Arc<Self>, id: StoreId) -> Result<metapb::Store> {
-        retry_mut!(self, "get_store", |cluster| async {
+        retry!(self, "get_store", |cluster| async {
             cluster
                 .get_store(id, self.timeout)
                 .await
@@ -180,7 +181,7 @@ impl RetryClientTrait for RetryClient<Cluster> {
     }
 
     async fn get_all_stores(self: Arc<Self>) -> Result<Vec<metapb::Store>> {
-        retry_mut!(self, "get_all_stores", |cluster| async {
+        retry!(self, "get_all_stores", |cluster| async {
             cluster
                 .get_all_stores(self.timeout)
                 .await
@@ -193,7 +194,7 @@ impl RetryClientTrait for RetryClient<Cluster> {
     }
 
     async fn update_safepoint(self: Arc<Self>, safepoint: u64) -> Result<bool> {
-        retry_mut!(self, "update_gc_safepoint", |cluster| async {
+        retry!(self, "update_gc_safepoint", |cluster| async {
             cluster
                 .update_safepoint(safepoint, self.timeout)
                 .await
@@ -202,7 +203,7 @@ impl RetryClientTrait for RetryClient<Cluster> {
     }
 
     async fn load_keyspace(&self, keyspace: &str) -> Result<keyspacepb::KeyspaceMeta> {
-        retry_mut!(self, "load_keyspace", |cluster| async {
+        retry!(self, "load_keyspace", |cluster| async {
             cluster.load_keyspace(keyspace, self.timeout).await
         })
     }
@@ -267,6 +268,7 @@ mod test {
         struct MockClient {
             reconnect_count: AtomicUsize,
             cluster: RwLock<((), Instant)>,
+            permits: Arc<Semaphore>,
         }
 
         #[async_trait]
@@ -282,7 +284,7 @@ mod test {
         }
 
         async fn retry_err(client: Arc<MockClient>) -> Result<()> {
-            retry_mut!(client, "test", |_c| ready(Err(internal_err!("whoops"))))
+            retry!(client, "test", |_c| ready(Err(internal_err!("whoops"))))
         }
 
         async fn retry_ok(client: Arc<MockClient>) -> Result<()> {
@@ -293,6 +295,7 @@ mod test {
             let client = Arc::new(MockClient {
                 reconnect_count: AtomicUsize::new(0),
                 cluster: RwLock::new(((), Instant::now())),
+                permits: Arc::new(Semaphore::new(MAX_CONCURRENT_PD_REQUESTS)),
             });
 
             assert!(retry_err(client.clone()).await.is_err());
@@ -320,6 +323,7 @@ mod test {
     fn test_retry() {
         struct MockClient {
             cluster: RwLock<(AtomicUsize, Instant)>,
+            permits: Arc<Semaphore>,
         }
 
         #[async_trait]
@@ -335,7 +339,7 @@ mod test {
             client: Arc<MockClient>,
             max_retries: Arc<AtomicUsize>,
         ) -> Result<()> {
-            retry_mut!(client, "test", |c| {
+            retry!(client, "test", |c| {
                 c.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
 
                 let max_retries = max_retries.fetch_sub(1, Ordering::SeqCst) - 1;
@@ -366,6 +370,7 @@ mod test {
         executor::block_on(async {
             let client = Arc::new(MockClient {
                 cluster: RwLock::new((AtomicUsize::new(0), Instant::now())),
+                permits: Arc::new(Semaphore::new(MAX_CONCURRENT_PD_REQUESTS)),
             });
             let max_retries = Arc::new(AtomicUsize::new(1000));
 
@@ -377,6 +382,7 @@ mod test {
 
             let client = Arc::new(MockClient {
                 cluster: RwLock::new((AtomicUsize::new(0), Instant::now())),
+                permits: Arc::new(Semaphore::new(MAX_CONCURRENT_PD_REQUESTS)),
             });
             let max_retries = Arc::new(AtomicUsize::new(2));
 
