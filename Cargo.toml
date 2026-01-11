@@ -10,7 +10,7 @@ edition = "2021"
 
 [features]
 default = ["prometheus"]
-prometheus = ["prometheus/push", "prometheus/process"]
+prometheus = ["prometheus/process"]
 # Enable integration tests with a running TiKV and PD instance.
 # Use $PD_ADDRS, comma separated, to set the addresses the tests use.
 integration-tests = []
