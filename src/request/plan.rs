@@ -2,6 +2,7 @@
 
 use std::marker::PhantomData;
 use std::sync::Arc;
+use std::time::Instant;
 
 use async_recursion::async_recursion;
 use async_trait::async_trait;
@@ -24,6 +25,7 @@ use crate::request::NextBatch;
 use crate::request::Shardable;
 use crate::request::{KvRequest, StoreRequest};
 use crate::stats::tikv_stats;
+use crate::stats::{observe_multi_region_phase, observe_multi_region_shards};
 use crate::store::HasRegionError;
 use crate::store::HasRegionErrors;
 use crate::store::KvClient;
@@ -48,6 +50,14 @@ pub trait Plan: Sized + Clone + Sync + Send + 'static {
 
     /// Execute the plan.
     async fn execute(&self) -> Result<Self::Result>;
+
+    /// A stable operation label for plan-level metrics.
+    ///
+    /// Defaults to `"unknown"` for custom plans; most built-in request plans override this to
+    /// return the underlying gRPC request label (e.g. "raw_batch_get", "raw_batch_put").
+    fn label(&self) -> &'static str {
+        "unknown"
+    }
 }
 
 /// The simplest plan which just dispatches a request to a specific kv server.
@@ -74,6 +84,10 @@ impl<Req: KvRequest> Plan for Dispatch<Req> {
             *r.downcast()
                 .expect("Downcast failed: request and response type mismatch")
         })
+    }
+
+    fn label(&self) -> &'static str {
+        self.request.label()
     }
 }
 
@@ -115,11 +129,20 @@ where
         permits: Arc<Semaphore>,
         preserve_region_results: bool,
     ) -> Result<<Self as Plan>::Result> {
+        let op = current_plan.label();
+        let shard_start = Instant::now();
         let shards = current_plan.shards(&pd_client).collect::<Vec<_>>().await;
+        let shard_elapsed = shard_start.elapsed().as_secs_f64();
         debug!("single_plan_handler, shards: {}", shards.len());
         let mut handles = Vec::with_capacity(shards.len());
         for shard in shards {
-            let (shard, region) = shard?;
+            let (shard, region) = match shard {
+                Ok(x) => x,
+                Err(e) => {
+                    observe_multi_region_phase(op, "shard", false, shard_elapsed);
+                    return Err(e);
+                }
+            };
             let clone = current_plan.clone_then_apply_shard(shard);
             let handle = tokio::spawn(Self::single_shard_handler(
                 pd_client.clone(),
@@ -131,8 +154,18 @@ where
             ));
             handles.push(handle);
         }
+        observe_multi_region_phase(op, "shard", true, shard_elapsed);
+        observe_multi_region_shards(op, handles.len());
 
-        let results = try_join_all(handles).await?;
+        let exec_start = Instant::now();
+        let join_res = try_join_all(handles).await;
+        observe_multi_region_phase(
+            op,
+            "execute",
+            join_res.is_ok(),
+            exec_start.elapsed().as_secs_f64(),
+        );
+        let results = join_res?;
         if preserve_region_results {
             Ok(results
                 .into_iter()
@@ -416,6 +449,10 @@ where
         )
         .await
     }
+
+    fn label(&self) -> &'static str {
+        self.inner.label()
+    }
 }
 
 pub struct RetryableAllStores<P: Plan, PdC: PdClient> {
@@ -525,6 +562,10 @@ impl<In: Clone + Send + Sync + 'static, P: Plan<Result = Vec<Result<In>>>, M: Me
     async fn execute(&self) -> Result<Self::Result> {
         self.merge.merge(self.inner.execute().await?)
     }
+
+    fn label(&self) -> &'static str {
+        self.inner.label()
+    }
 }
 
 /// A merge strategy which collects data from a response into a single type.
@@ -590,6 +631,10 @@ impl<P: Plan, Pr: Process<P::Result>> Plan for ProcessResponse<P, Pr> {
     async fn execute(&self) -> Result<Self::Result> {
         self.processor.process(self.inner.execute().await)
     }
+
+    fn label(&self) -> &'static str {
+        self.inner.label()
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -647,6 +692,10 @@ where
                 }
             }
         }
+    }
+
+    fn label(&self) -> &'static str {
+        self.inner.label()
     }
 }
 
@@ -805,6 +854,10 @@ where
 
         Ok(result)
     }
+
+    fn label(&self) -> &'static str {
+        self.inner.label()
+    }
 }
 
 /// When executed, the plan extracts errors from its inner plan, and returns an
@@ -849,6 +902,10 @@ where
             Ok(result)
         }
     }
+
+    fn label(&self) -> &'static str {
+        self.inner.label()
+    }
 }
 
 /// When executed, the plan clones the shard and execute its inner plan, then
@@ -885,6 +942,10 @@ where
             .expect("Unreachable: Shardable::apply_shard() is not called before executing PreserveShard")
             .clone();
         Ok(ResponseWithShard(res, shard))
+    }
+
+    fn label(&self) -> &'static str {
+        self.inner.label()
     }
 }
 

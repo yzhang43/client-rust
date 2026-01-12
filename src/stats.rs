@@ -53,6 +53,22 @@ impl RequestStats {
     }
 }
 
+/// Observations for multi-region request execution, split into phases.
+///
+/// These are *client-side* timings intended to explain end-to-end latency for operations like
+/// raw batch_get/batch_put which fan out across many regions.
+pub fn observe_multi_region_phase(op: &'static str, phase: &'static str, ok: bool, secs: f64) {
+    MULTI_REGION_PHASE_DURATION_HISTOGRAM_VEC
+        .with_label_values(&[op, phase, if ok { "ok" } else { "err" }])
+        .observe(secs);
+}
+
+pub fn observe_multi_region_shards(op: &'static str, shards: usize) {
+    MULTI_REGION_SHARD_COUNT_HISTOGRAM_VEC
+        .with_label_values(&[op])
+        .observe(shards as f64);
+}
+
 pub fn tikv_stats(cmd: &'static str) -> RequestStats {
     RequestStats::new(
         cmd,
@@ -130,6 +146,20 @@ lazy_static::lazy_static! {
     static ref PD_TSO_BATCH_SIZE_HISTOGRAM: Histogram = register_histogram!(
         "pd_tso_batch_size",
         "Bucketed histogram of TSO request batch size"
+    )
+    .unwrap();
+
+    static ref MULTI_REGION_PHASE_DURATION_HISTOGRAM_VEC: HistogramVec = register_histogram_vec!(
+        "tikv_client_multi_region_phase_duration_seconds",
+        "Bucketed histogram of multi-region client request phase durations",
+        &["op", "phase", "result"]
+    )
+    .unwrap();
+
+    static ref MULTI_REGION_SHARD_COUNT_HISTOGRAM_VEC: HistogramVec = register_histogram_vec!(
+        "tikv_client_multi_region_shards",
+        "Bucketed histogram of shard counts for multi-region client requests",
+        &["op"]
     )
     .unwrap();
 }
