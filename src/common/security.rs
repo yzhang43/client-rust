@@ -16,6 +16,18 @@ use tonic::transport::{Certificate, Endpoint};
 use crate::internal_err;
 use crate::Result;
 
+// Transport-level hardening for gRPC (tonic/hyper).
+//
+// The "h2 protocol error ... connection error detected" we see under load is typically a
+// transport-level disconnect/reset (often from proxies/LBs closing idle connections, midstream
+// GOAWAY/RESET, or server/network churn). HTTP/2 keepalive pings + sane connect timeouts reduce
+// incidence significantly.
+const GRPC_TCP_KEEPALIVE_SECS: u64 = 10;
+// Must be lower than any intermediate idle timeout (e.g. LB/NAT). Tune as needed.
+const GRPC_HTTP2_KEEPALIVE_INTERVAL_SECS: u64 = 10;
+const GRPC_KEEPALIVE_TIMEOUT_SECS: u64 = 3;
+const GRPC_CONNECT_TIMEOUT_SECS: u64 = 3;
+
 lazy_static::lazy_static! {
     static ref SCHEME_REG: Regex = Regex::new(r"^\s*(https?://)").unwrap();
 }
@@ -108,8 +120,13 @@ impl SecurityManager {
 
     fn endpoint(&self, addr: String) -> Result<Endpoint> {
         let endpoint = Channel::from_shared(addr)?
-            .tcp_keepalive(Some(Duration::from_secs(10)))
-            .keep_alive_timeout(Duration::from_secs(3));
+            .connect_timeout(Duration::from_secs(GRPC_CONNECT_TIMEOUT_SECS))
+            .tcp_keepalive(Some(Duration::from_secs(GRPC_TCP_KEEPALIVE_SECS)))
+            // Send periodic HTTP/2 pings to keep connections alive across LBs/NATs.
+            .http2_keep_alive_interval(Duration::from_secs(GRPC_HTTP2_KEEPALIVE_INTERVAL_SECS))
+            .keep_alive_timeout(Duration::from_secs(GRPC_KEEPALIVE_TIMEOUT_SECS))
+            .keep_alive_while_idle(true)
+            .tcp_nodelay(true);
         Ok(endpoint)
     }
 }

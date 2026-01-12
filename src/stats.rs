@@ -7,6 +7,7 @@ use prometheus::register_histogram;
 use prometheus::register_histogram_vec;
 use prometheus::register_int_counter_vec;
 use prometheus::Histogram;
+use prometheus::HistogramOpts;
 use prometheus::HistogramVec;
 use prometheus::IntCounterVec;
 
@@ -149,19 +150,35 @@ lazy_static::lazy_static! {
     )
     .unwrap();
 
-    static ref MULTI_REGION_PHASE_DURATION_HISTOGRAM_VEC: HistogramVec = register_histogram_vec!(
-        "tikv_client_multi_region_phase_duration_seconds",
-        "Bucketed histogram of multi-region client request phase durations",
-        &["op", "phase", "result"]
-    )
-    .unwrap();
+    static ref MULTI_REGION_PHASE_DURATION_HISTOGRAM_VEC: HistogramVec = {
+        // Default prometheus buckets top out at 10s, which is too small for high fan-out workloads.
+        let opts = HistogramOpts::new(
+            "tikv_client_multi_region_phase_duration_seconds",
+            "Bucketed histogram of multi-region client request phase durations",
+        )
+        .buckets(vec![
+            0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 15.0,
+            30.0, 60.0, 120.0,
+        ]);
+        let vec = HistogramVec::new(opts, &["op", "phase", "result"]).unwrap();
+        prometheus::register(Box::new(vec.clone())).unwrap();
+        vec
+    };
 
-    static ref MULTI_REGION_SHARD_COUNT_HISTOGRAM_VEC: HistogramVec = register_histogram_vec!(
-        "tikv_client_multi_region_shards",
-        "Bucketed histogram of shard counts for multi-region client requests",
-        &["op"]
-    )
-    .unwrap();
+    static ref MULTI_REGION_SHARD_COUNT_HISTOGRAM_VEC: HistogramVec = {
+        // Shard counts can be in the thousands+; default buckets (<=10) are not useful here.
+        let opts = HistogramOpts::new(
+            "tikv_client_multi_region_shards",
+            "Bucketed histogram of shard counts for multi-region client requests",
+        )
+        .buckets(vec![
+            1.0, 2.0, 4.0, 8.0, 16.0, 32.0, 64.0, 128.0, 256.0, 512.0, 1_000.0, 2_000.0,
+            4_000.0, 8_000.0, 16_000.0, 32_000.0,
+        ]);
+        let vec = HistogramVec::new(opts, &["op"]).unwrap();
+        prometheus::register(Box::new(vec.clone())).unwrap();
+        vec
+    };
 }
 
 /// Convert Duration to seconds.
