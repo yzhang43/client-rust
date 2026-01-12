@@ -10,6 +10,7 @@ use futures::future::try_join_all;
 use futures::prelude::*;
 use log::debug;
 use log::info;
+use log::warn;
 use tokio::sync::Semaphore;
 use tokio::time::sleep;
 
@@ -79,6 +80,11 @@ impl<Req: KvRequest> Plan for Dispatch<Req> {
             .expect("Unreachable: kv_client has not been initialised in Dispatch")
             .dispatch(&self.request)
             .await;
+        if let Err(ref e) = result {
+            // High-signal error log for the underlying TiKV RPC. Note that some logical errors
+            // (e.g. region/key errors carried in successful responses) are handled at higher layers.
+            warn!("tikv rpc error op={} err={:?}", self.request.label(), e);
+        }
         let result = stats.done(result);
         result.map(|r| {
             *r.downcast()
@@ -222,7 +228,7 @@ where
                 .await;
             }
             Err(err) => {
-                debug!("single_shard_handler::sharding, error: {:?}", err);
+                warn!("single_shard_handler::sharding, error: {:?}", err);
                 return Err(err);
             }
         };
@@ -235,7 +241,7 @@ where
         let mut resp = match res {
             Ok(resp) => resp,
             Err(e) if is_grpc_error(&e) => {
-                debug!("single_shard_handler:execute: grpc error: {:?}", e);
+                warn!("single_shard_handler:execute: grpc error: {:?}", e);
                 return Self::handle_other_error(
                     pd_client,
                     plan,
@@ -249,16 +255,23 @@ where
                 .await;
             }
             Err(e) => {
-                debug!("single_shard_handler:execute: error: {:?}", e);
+                // Non-gRPC errors here typically indicate unexpected client-side issues.
+                warn!(
+                    "tikv shard error op={} region={:?} store={:?} err={:?}",
+                    plan.label(),
+                    region_store.region_with_leader.ver_id(),
+                    region_store.region_with_leader.get_store_id().ok(),
+                    e
+                );
                 return Err(e);
             }
         };
 
         if let Some(e) = resp.key_errors() {
-            debug!("single_shard_handler:execute: key errors: {:?}", e);
+            warn!("single_shard_handler:execute: key errors: {:?}", e);
             Ok(vec![Err(Error::MultipleKeyErrors(e))])
         } else if let Some(e) = resp.region_error() {
-            debug!("single_shard_handler:execute: region error: {:?}", e);
+            warn!("single_shard_handler:execute: region error: {:?}", e);
             match backoff.next_delay_duration() {
                 Some(duration) => {
                     let region_error_resolved =
@@ -276,7 +289,16 @@ where
                     )
                     .await
                 }
-                None => Err(Error::RegionError(Box::new(e))),
+                None => {
+                    warn!(
+                        "tikv shard region error (exhausted) op={} region={:?} store={:?} err={:?}",
+                        plan.label(),
+                        region_store.region_with_leader.ver_id(),
+                        region_store.region_with_leader.get_store_id().ok(),
+                        e
+                    );
+                    Err(Error::RegionError(Box::new(e)))
+                }
             }
         } else {
             Ok(vec![Ok(resp)])
@@ -294,7 +316,8 @@ where
         preserve_region_results: bool,
         e: Error,
     ) -> Result<<Self as Plan>::Result> {
-        debug!("handle_other_error: {:?}", e);
+        warn!("handle_other_error: {:?}", e);
+        let region_for_log = region.clone();
         pd_client.invalidate_region_cache(region).await;
         if is_grpc_error(&e) {
             if let Some(store_id) = store {
@@ -313,7 +336,17 @@ where
                 )
                 .await
             }
-            None => Err(e),
+            None => {
+                // Retries exhausted: surface the final error with region/store context.
+                warn!(
+                    "tikv shard failed (exhausted) op={} region={:?} store={:?} err={:?}",
+                    plan.label(),
+                    region_for_log,
+                    store,
+                    e
+                );
+                Err(e)
+            }
         }
     }
 }
@@ -327,7 +360,7 @@ pub(crate) async fn handle_region_error<PdC: PdClient>(
     e: errorpb::Error,
     region_store: RegionStore,
 ) -> Result<bool> {
-    debug!("handle_region_error: {:?}", e);
+    warn!("handle_region_error: {:?}", e);
     let ver_id = region_store.region_with_leader.ver_id();
     let store_id = region_store.region_with_leader.get_store_id();
     if let Some(not_leader) = e.not_leader {
