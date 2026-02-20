@@ -84,8 +84,8 @@ impl<Req: KvRequest + StoreRequest> StoreRequest for Dispatch<Req> {
     }
 }
 
-const MULTI_REGION_CONCURRENCY: usize = 128;
-const MULTI_STORES_CONCURRENCY: usize = 128;
+const MULTI_REGION_CONCURRENCY: usize = 16;
+const MULTI_STORES_CONCURRENCY: usize = 16;
 
 fn is_grpc_error(e: &Error) -> bool {
     matches!(e, Error::GrpcAPI(_) | Error::Grpc(_))
@@ -328,10 +328,9 @@ pub(crate) async fn handle_region_error<PdC: PdClient>(
     } else if e.stale_command.is_some() || e.region_not_found.is_some() {
         pd_client.invalidate_region_cache(ver_id).await;
         Ok(false)
-    } else if e.server_is_busy.is_some()
-        || e.raft_entry_too_large.is_some()
-        || e.max_timestamp_not_synced.is_some()
-    {
+    } else if e.server_is_busy.is_some() {
+        Ok(false)
+    } else if e.raft_entry_too_large.is_some() || e.max_timestamp_not_synced.is_some() {
         Err(Error::RegionError(Box::new(e)))
     } else {
         // TODO: pass the logger around
